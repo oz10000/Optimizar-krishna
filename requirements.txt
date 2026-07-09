@@ -1,0 +1,13 @@
+# KRISHNA OMEGA ULTRA — Dependencias del sistema
+
+# Cliente HTTP para API de OKX
+requests>=2.28.0
+
+# Cálculos numéricos y arrays
+numpy>=1.23.0
+
+# Manipulación de datos y backtesting
+pandas>=2.0.0
+
+# (Opcional) Optimización bayesiana - solo si usas --mode optimize
+# scikit-optimize>=0.9.0
