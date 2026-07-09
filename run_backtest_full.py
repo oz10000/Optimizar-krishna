@@ -3,9 +3,7 @@
 
 """
 KRISHNA OMEGA ULTRA — Backtest completo con datos históricos de OKX
-- Descarga automática de velas de 5 minutos (30 días)
-- Ejecuta el motor de backtesting
-- Genera tablas comparativas con métricas y estadísticas
+Versión robusta con manejo de errores y fallback.
 """
 
 import os
@@ -31,35 +29,41 @@ CAPITAL_INICIAL = 1000.0
 TRADE_NOTIONAL = 100.0
 
 # ============================================================
-# 1. DESCARGA DE DATOS (API PÚBLICA OKX)
+# 1. DESCARGA DE DATOS CON FALLBACK Y REINTENTOS
 # ============================================================
-def get_okx_candles(symbol, after=None):
+def get_okx_candles(symbol, after=None, retries=3):
     inst_id = f"{symbol}-USDT-SWAP"
     url = "https://www.okx.com/api/v5/market/history-candles"
     params = {'instId': inst_id, 'bar': BAR, 'limit': LIMIT}
     if after:
         params['after'] = after
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if data.get('code') != '0':
-            return None
-        raw = data.get('data', [])
-        if not raw:
-            return None
-        df = pd.DataFrame(raw, columns=['ts','o','h','l','c','vol','vc','vq','cf'])
-        df['ts'] = pd.to_datetime(df['ts'].astype('int64'), unit='ms')
-        for col in ['o','h','l','c','vol']:
-            df[col] = df[col].astype(float)
-        return df[['ts','o','h','l','c','vol']]
-    except Exception as e:
-        return None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            data = r.json()
+            if data.get('code') != '0':
+                print(f"    Intento {attempt+1}: OKX error {data.get('code')}")
+                time.sleep(1)
+                continue
+            raw = data.get('data', [])
+            if not raw:
+                return None
+            df = pd.DataFrame(raw, columns=['ts','o','h','l','c','vol','vc','vq','cf'])
+            df['ts'] = pd.to_datetime(df['ts'].astype('int64'), unit='ms')
+            for col in ['o','h','l','c','vol']:
+                df[col] = df[col].astype(float)
+            return df[['ts','o','h','l','c','vol']]
+        except Exception as e:
+            print(f"    Intento {attempt+1}: {e}")
+            time.sleep(2)
+    return None
 
 def fetch_historical(symbol, days=DAYS):
     start = datetime.now() - timedelta(days=days)
     frames = []
     after = None
-    for _ in range(50):
+    max_loops = 50
+    for _ in range(max_loops):
         df = get_okx_candles(symbol, after)
         if df is None or df.empty:
             break
@@ -68,7 +72,7 @@ def fetch_historical(symbol, days=DAYS):
         if last_ts < pd.Timestamp(start):
             break
         after = int(last_ts.timestamp() * 1000)
-        time.sleep(0.2)
+        time.sleep(0.3)
     if not frames:
         return None
     full = pd.concat(frames, ignore_index=True).drop_duplicates('ts').sort_values('ts')
@@ -79,16 +83,17 @@ def download_all_data():
     os.makedirs(DATA_DIR, exist_ok=True)
     print("📥 Descargando datos históricos de OKX...")
     for sym in SYMBOLS:
+        print(f"  Descargando {sym}...")
         df = fetch_historical(sym)
         if df is not None and not df.empty:
             df.to_csv(f"{DATA_DIR}/{sym}.csv", index=False)
-            print(f"  ✅ {sym}: {len(df)} velas")
+            print(f"    ✅ {len(df)} velas")
         else:
-            print(f"  ⚠️ {sym}: sin datos")
+            print(f"    ⚠️ Sin datos para {sym}")
     print(f"Datos guardados en {DATA_DIR}/\n")
 
 # ============================================================
-# 2. INDICADORES (VERSIÓN LOCAL PARA BACKTEST)
+# 2. INDICADORES (VERSIÓN LOCAL)
 # ============================================================
 def compute_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
@@ -238,27 +243,22 @@ def calculate_metrics(trades, initial_capital, final_equity):
     avg_win = wins.mean() if len(wins) > 0 else 0
     avg_loss = losses.mean() if len(losses) > 0 else 0
     expectancy = np.mean(pnls)
-    # Drawdown
     eq = np.array([initial_capital] + list(np.cumsum(pnls) + initial_capital))
     peak = np.maximum.accumulate(eq)
     dd = (peak - eq) / peak * 100
     max_dd = dd.max()
-    # Sharpe
     ret_daily = pnls / initial_capital
     if len(ret_daily) > 1:
-        sharpe = np.mean(ret_daily) / np.std(ret_daily) * np.sqrt(30*24*12)  # anualizado
+        sharpe = np.mean(ret_daily) / np.std(ret_daily) * np.sqrt(30*24*12)
     else:
         sharpe = 0
-    # Sortino (solo riesgo a la baja)
     downside = ret_daily[ret_daily < 0]
     if len(downside) > 0:
         sortino = np.mean(ret_daily) / np.std(downside) * np.sqrt(30*24*12)
     else:
         sortino = float('inf')
-    # Calmar
     cagr = ((final_equity / initial_capital) ** (365/30) - 1) * 100 if max_dd > 0 else 0
     calmar = cagr / max_dd if max_dd > 0 else float('inf')
-    # Duración media (si hay timestamp)
     if 'timestamp' in df.columns:
         durations = df['timestamp'].diff().dt.total_seconds().dropna()
         avg_duration = durations.mean() / 60 if len(durations) > 0 else 0
@@ -293,7 +293,6 @@ def generate_tables(results):
         if k not in ['trades']:
             print(f"{k:25}: {v}")
 
-    # Desglose por símbolo
     if 'trades' in results:
         df = pd.DataFrame(results['trades'])
         if not df.empty:
@@ -308,7 +307,6 @@ def generate_tables(results):
                 pnl = sub['pnl'].sum()
                 print(f"{sym:<10} {len(sub):>8} {wr:>11.2f}% {pnl:>15.2f}")
 
-            # Resultados por dirección
             print("\n" + "="*70)
             print("📊 TABLA 3 — POR DIRECCIÓN")
             print("="*70)
@@ -319,7 +317,6 @@ def generate_tables(results):
                     pnl = sub['pnl'].sum()
                     print(f"{dir_:<10} Trades:{len(sub):>4} WinRate:{wr:>6.2f}% PnL:{pnl:>8.2f}")
 
-            # PnL por hora
             if 'timestamp' in df.columns:
                 df['hour'] = df['timestamp'].dt.hour
                 hourly = df.groupby('hour')['pnl'].sum()
@@ -334,21 +331,28 @@ def generate_tables(results):
 # ============================================================
 def main():
     print("🚀 KRISHNA OMEGA ULTRA — BACKTEST COMPLETO")
-    # Descargar datos
-    download_all_data()
-    # Cargar datos
+    try:
+        download_all_data()
+    except Exception as e:
+        print(f"❌ Error descargando datos: {e}")
+        sys.exit(1)
+
     data = {}
     for sym in SYMBOLS:
         file = f"{DATA_DIR}/{sym}.csv"
         if os.path.exists(file):
-            data[sym] = pd.read_csv(file, parse_dates=['ts'])
-            print(f"  Cargado {sym}: {len(data[sym])} velas")
+            try:
+                data[sym] = pd.read_csv(file, parse_dates=['ts'])
+                print(f"  Cargado {sym}: {len(data[sym])} velas")
+            except Exception as e:
+                print(f"  ⚠️ Error cargando {sym}: {e}")
         else:
             print(f"  ⚠️ {file} no encontrado")
+
     if not data:
         print("❌ No hay datos. Saliendo.")
-        return
-    # Parámetros base (los de config.py)
+        sys.exit(1)
+
     params = {
         'TP_MULT': 1.8,
         'SL_MULT': 0.9,
@@ -371,7 +375,6 @@ def main():
     metrics = calculate_metrics(trades, CAPITAL_INICIAL, final_equity)
     metrics['trades'] = trades
     generate_tables(metrics)
-    # Guardar resultados
     os.makedirs(RESULTS_DIR, exist_ok=True)
     pd.DataFrame(trades).to_csv(f"{RESULTS_DIR}/trades.csv", index=False)
     with open(f"{RESULTS_DIR}/metrics.json", "w") as f:
